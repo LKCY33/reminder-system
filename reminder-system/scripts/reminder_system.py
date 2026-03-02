@@ -179,12 +179,32 @@ def cmd_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _iso_local(dt: datetime, tz: ZoneInfo) -> str:
+    return dt.astimezone(tz).replace(tzinfo=None).isoformat(sep=" ", timespec="minutes")
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     state = _load_state(args.state)
+    tz_name = _local_tz_name()
+    tz = ZoneInfo(tz_name)
+
     reminders = state.get("reminders", [])
     if args.status:
         reminders = [r for r in reminders if r.get("status") == args.status]
-    print(json.dumps(reminders, ensure_ascii=False, indent=2))
+
+    # Add human-friendly local timestamps without changing the stored source of truth.
+    out: List[Dict[str, Any]] = []
+    for r in reminders:
+        rr = dict(r)
+        try:
+            due_utc = datetime.fromisoformat(rr["next_run_at"].replace("Z", "+00:00"))
+            rr["next_run_local"] = _iso_local(due_utc, tz)
+            rr["timezone"] = tz_name
+        except Exception:
+            pass
+        out.append(rr)
+
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -237,11 +257,18 @@ def cmd_run_due(args: argparse.Namespace) -> int:
         if due > now:
             continue
 
+        tz_name = _local_tz_name()
+        tz = ZoneInfo(tz_name)
+
         payload = {
             "id": r.get("id"),
             "title": r.get("title"),
             "notes": r.get("notes"),
             "due": r.get("next_run_at"),
+            "due_local": _iso_local(due, tz),
+            "timezone": tz_name,
+            "now": _iso(now),
+            "now_local": _iso_local(now, tz),
         }
 
         if "chat_stdout" in (r.get("channels") or []):
