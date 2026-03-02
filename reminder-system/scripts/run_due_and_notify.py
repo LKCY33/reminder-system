@@ -28,6 +28,29 @@ def _openclaw_message_send(text: str, channel: str, target: str) -> bool:
     return p.returncode == 0
 
 
+def _load_state(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {"reminders": []}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _find_route(state: Dict[str, Any], rid: str) -> Dict[str, str]:
+    for r in state.get("reminders", []):
+        if r.get("id") == rid:
+            route = r.get("route") or {}
+            if isinstance(route, dict):
+                ch = route.get("channel")
+                tgt = route.get("target")
+                out: Dict[str, str] = {}
+                if ch:
+                    out["channel"] = ch
+                if tgt:
+                    out["target"] = tgt
+                return out
+    return {}
+
+
 def _format_payload(payload: Dict[str, Any]) -> str:
     title = payload.get("title") or "(no title)"
     rid = payload.get("id")
@@ -57,10 +80,16 @@ def main(argv: List[str]) -> int:
         default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"),
         help="Path to state.json",
     )
-    ap.add_argument("--channel", default="feishu")
-    ap.add_argument("--target", default="user:ou_4da26eb40cfb44caee9ad41074668bba")
+    ap.add_argument("--channel", default="feishu", help="Fallback channel if reminder has no route")
+    ap.add_argument(
+        "--target",
+        default="user:ou_4da26eb40cfb44caee9ad41074668bba",
+        help="Fallback target if reminder has no route",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
+
+    state = _load_state(args.state)
 
     cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "reminder_system.py"), "--state", args.state, "run-due"]
     p = _run(cmd)
@@ -87,10 +116,17 @@ def main(argv: List[str]) -> int:
 
     for payload in fired:
         msg = _format_payload(payload)
+
+        rid = payload.get("id")
+        route = _find_route(state, rid) if rid else {}
+        channel = route.get("channel") or args.channel
+        target = route.get("target") or args.target
+
         if args.dry_run:
-            print(msg)
+            print(json.dumps({"channel": channel, "target": target, "message": msg}, ensure_ascii=False))
             continue
-        ok = _openclaw_message_send(msg, args.channel, args.target)
+
+        ok = _openclaw_message_send(msg, channel, target)
         if not ok:
             print("failed to send message", file=sys.stderr)
             return 1
