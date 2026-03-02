@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 
 STATE_VERSION = 1
-DEFAULT_TZ = "America/Los_Angeles"
+DEFAULT_TZ = "Asia/Shanghai"
 
 
 def _utc_now() -> datetime:
@@ -22,9 +22,26 @@ def _utc_now() -> datetime:
 
 
 def _local_tz_name() -> str:
-    # On macOS, /etc/localtime points at the current system timezone.
-    # time.tzname is not a stable IANA tz id, so we prefer TZ env or fall back.
-    return os.environ.get("TZ") or DEFAULT_TZ
+    # Determine an IANA timezone id.
+    #
+    # Order:
+    # 1) TZ env var (explicit override)
+    # 2) macOS /etc/localtime symlink target (stable and reflects System Settings)
+    # 3) fallback DEFAULT_TZ (Beijing)
+
+    tz_env = os.environ.get("TZ")
+    if tz_env:
+        return tz_env
+
+    try:
+        target = os.path.realpath("/etc/localtime")
+        marker = "/zoneinfo/"
+        if marker in target:
+            return target.split(marker, 1)[1]
+    except Exception:
+        pass
+
+    return DEFAULT_TZ
 
 
 def _parse_when_local_to_utc(s: str, tz: ZoneInfo) -> datetime:
