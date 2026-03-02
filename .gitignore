@@ -1,0 +1,4 @@
+.DS_Store
+# local runtime state
+reminder-system/data/
+*.skill
