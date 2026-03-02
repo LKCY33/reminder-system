@@ -78,10 +78,24 @@ def _load_state(path: str) -> Dict[str, Any]:
         return {
             "version": STATE_VERSION,
             "timezone": DEFAULT_TZ,
+            "defaults": {
+                "lookahead_minutes": 60,
+                "offset_minutes": -10,
+            },
             "reminders": [],
         }
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        state = json.load(f)
+
+    # Backfill defaults for existing state files.
+    defaults = state.get("defaults")
+    if not isinstance(defaults, dict):
+        defaults = {}
+        state["defaults"] = defaults
+    defaults.setdefault("lookahead_minutes", 60)
+    defaults.setdefault("offset_minutes", -10)
+
+    return state
 
 
 def _atomic_write_json(path: str, obj: Dict[str, Any]) -> None:
@@ -150,7 +164,12 @@ def cmd_create(args: argparse.Namespace) -> int:
     tz_name = _local_tz_name()
     tz = ZoneInfo(tz_name)
     when = _parse_when_local_to_utc(args.when, tz)
-    fire_at = when + timedelta(minutes=args.offset_minutes)
+
+    defaults = state.get("defaults") or {}
+    default_offset = defaults.get("offset_minutes", -10)
+    offset_minutes = args.offset_minutes if args.offset_minutes is not None else int(default_offset)
+
+    fire_at = when + timedelta(minutes=offset_minutes)
 
     reminder: Dict[str, Any] = {
         "id": rid,
@@ -161,7 +180,7 @@ def cmd_create(args: argparse.Namespace) -> int:
             "type": "once",
             "value": args.when,
             "timezone": tz_name,
-            "offset_minutes": args.offset_minutes,
+            "offset_minutes": offset_minutes,
         },
         "event_at": _iso(when),
         "next_run_at": _iso(fire_at),
@@ -308,8 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument(
         "--offset-minutes",
         type=int,
-        default=0,
-        help="Offset minutes for notification time: -10 means 10 minutes early; 0 on time; +10 late",
+        default=None,
+        help="Offset minutes for notification time: -10 means 10 minutes early; 0 on time; +10 late. If omitted, uses state defaults.offset_minutes.",
     )
     c.add_argument("--notes", default="")
     c.add_argument("--mirror", choices=["none", "apple"], default="none")

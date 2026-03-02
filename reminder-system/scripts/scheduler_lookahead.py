@@ -78,15 +78,24 @@ def main(argv: List[str]) -> int:
         "--state",
         default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"),
     )
-    ap.add_argument("--lookahead-minutes", type=int, default=60)
+    ap.add_argument(
+        "--lookahead-minutes",
+        type=int,
+        default=None,
+        help="Minutes to look ahead for upcoming reminders. If omitted, uses state defaults.lookahead_minutes.",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
     state = _load(args.state)
     idx = _ensure_job_index(state)
 
+    defaults = state.get("defaults") or {}
+    default_lookahead = defaults.get("lookahead_minutes", 60)
+    lookahead_minutes = args.lookahead_minutes if args.lookahead_minutes is not None else int(default_lookahead)
+
     now = _utc_now()
-    window_end = now + timedelta(minutes=args.lookahead_minutes)
+    window_end = now + timedelta(minutes=lookahead_minutes)
 
     planned: List[Dict[str, Any]] = []
 
