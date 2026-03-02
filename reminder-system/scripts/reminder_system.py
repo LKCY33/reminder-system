@@ -186,6 +186,10 @@ def cmd_create(args: argparse.Namespace) -> int:
         "next_run_at": _iso(fire_at),
         "channels": [],
         "backend_refs": {},
+        "route": {
+            "channel": args.route_channel,
+            "target": args.route_target,
+        },
         "created_at": _iso(_utc_now()),
         "updated_at": _iso(_utc_now()),
     }
@@ -333,6 +337,16 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--notes", default="")
     c.add_argument("--mirror", choices=["none", "apple"], default="none")
     c.add_argument("--notify", choices=["none", "stdout"], default="stdout")
+    c.add_argument(
+        "--route-channel",
+        default="feishu",
+        help="Delivery channel for notifications (feishu|telegram|...)",
+    )
+    c.add_argument(
+        "--route-target",
+        default="user:ou_4da26eb40cfb44caee9ad41074668bba",
+        help="Delivery target for notifications (e.g. feishu user:.../chat:..., telegram chat id/@username)",
+    )
     c.set_defaults(fn=cmd_create)
 
     l = sub.add_parser("list", help="List reminders")

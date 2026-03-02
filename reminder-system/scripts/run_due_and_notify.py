@@ -12,13 +12,13 @@ def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
-def _openclaw_message_send(text: str, target: str) -> bool:
+def _openclaw_message_send(text: str, channel: str, target: str) -> bool:
     cmd = [
         "openclaw",
         "message",
         "send",
         "--channel",
-        "feishu",
+        channel,
         "--target",
         target,
         "--message",
@@ -57,6 +57,7 @@ def main(argv: List[str]) -> int:
         default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"),
         help="Path to state.json",
     )
+    ap.add_argument("--channel", default="feishu")
     ap.add_argument("--target", default="user:ou_4da26eb40cfb44caee9ad41074668bba")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -89,7 +90,7 @@ def main(argv: List[str]) -> int:
         if args.dry_run:
             print(msg)
             continue
-        ok = _openclaw_message_send(msg, args.target)
+        ok = _openclaw_message_send(msg, args.channel, args.target)
         if not ok:
             print("failed to send message", file=sys.stderr)
             return 1
