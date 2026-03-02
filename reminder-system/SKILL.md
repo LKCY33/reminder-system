@@ -15,7 +15,7 @@ It keeps reminders in a local JSON file (source of truth), optionally mirrors th
 - Backends:
   - Apple Reminders (via `remindctl`) as a mirror
   - Chat notification (initially: print payload; integrate with OpenClaw messaging at the call site)
-- Scheduler model: a periodic job calls `scripts/reminder_system.py run-due`.
+- Scheduler model: a periodic job calls `scripts/scheduler_lookahead.py` to pre-schedule one-shot jobs, and the one-shot jobs trigger notifications.
 
 ## Quick Start
 
@@ -34,7 +34,13 @@ List reminders:
 python3 scripts/reminder_system.py list
 ```
 
-Run due reminders (for cron):
+Schedule one-shot jobs for reminders in the lookahead window:
+
+```bash
+python3 scripts/scheduler_lookahead.py --lookahead-minutes 60
+```
+
+Run due reminders (debug):
 
 ```bash
 python3 scripts/reminder_system.py run-due
