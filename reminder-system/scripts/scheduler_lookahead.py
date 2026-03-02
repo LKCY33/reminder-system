@@ -56,6 +56,10 @@ def _add_one_shot(job_name: str, at_iso: str, system_event: str) -> Optional[str
         job_name,
         "--at",
         at_iso,
+        "--session",
+        "main",
+        "--wake",
+        "now",
         "--delete-after-run",
         "--system-event",
         system_event,
@@ -124,7 +128,11 @@ def main(argv: List[str]) -> int:
             continue
 
         job_name = f"reminder-fire-{rid[:8]}"
-        system_event = json.dumps({"type": "reminder_fire", "id": rid}, ensure_ascii=False)
+        route = r.get("route") if isinstance(r.get("route"), dict) else None
+        system_event = {"type": "reminder_fire", "id": rid}
+        if route:
+            system_event["route"] = route
+        system_event = json.dumps(system_event, ensure_ascii=False)
 
         planned.append({"id": rid, "at": next_run_at, "job_name": job_name})
 
