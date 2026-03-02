@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 
 STATE_VERSION = 1
@@ -20,25 +21,35 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _parse_when(s: str) -> datetime:
-    """Parse a naive local timestamp as UTC for MVP.
+def _local_tz_name() -> str:
+    # On macOS, /etc/localtime points at the current system timezone.
+    # time.tzname is not a stable IANA tz id, so we prefer TZ env or fall back.
+    return os.environ.get("TZ") or DEFAULT_TZ
+
+
+def _parse_when_local_to_utc(s: str, tz: ZoneInfo) -> datetime:
+    """Parse a local timestamp string and convert it to UTC.
 
     Supported formats:
     - YYYY-MM-DD HH:MM
-    - YYYY-MM-DD
+    - YYYY-MM-DD (interpreted as 00:00)
 
-    Note: This MVP treats parsed times as local but stores them as UTC without conversion.
-    Wire in real timezone handling later.
+    Ambiguous DST times are handled by Python's default fold=0 behavior.
     """
 
     s = s.strip()
+    parsed: Optional[datetime] = None
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            dt = datetime.strptime(s, fmt)
-            return dt.replace(tzinfo=timezone.utc)
+            parsed = datetime.strptime(s, fmt)
+            break
         except ValueError:
-            pass
-    raise ValueError(f"Unsupported --when format: {s!r}")
+            continue
+    if parsed is None:
+        raise ValueError(f"Unsupported --when format: {s!r}")
+
+    local_dt = parsed.replace(tzinfo=tz)
+    return local_dt.astimezone(timezone.utc)
 
 
 def _iso(dt: datetime) -> str:
@@ -119,14 +130,16 @@ def cmd_create(args: argparse.Namespace) -> int:
     state = _load_state(state_path)
 
     rid = str(uuid.uuid4())
-    when = _parse_when(args.when)
+    tz_name = _local_tz_name()
+    tz = ZoneInfo(tz_name)
+    when = _parse_when_local_to_utc(args.when, tz)
 
     reminder: Dict[str, Any] = {
         "id": rid,
         "title": args.title,
         "notes": args.notes or "",
         "status": "active",
-        "schedule": {"type": "once", "value": args.when},
+        "schedule": {"type": "once", "value": args.when, "timezone": tz_name},
         "next_run_at": _iso(when),
         "channels": [],
         "backend_refs": {},
