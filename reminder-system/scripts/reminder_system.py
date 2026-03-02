@@ -150,14 +150,21 @@ def cmd_create(args: argparse.Namespace) -> int:
     tz_name = _local_tz_name()
     tz = ZoneInfo(tz_name)
     when = _parse_when_local_to_utc(args.when, tz)
+    fire_at = when + timedelta(minutes=args.offset_minutes)
 
     reminder: Dict[str, Any] = {
         "id": rid,
         "title": args.title,
         "notes": args.notes or "",
         "status": "active",
-        "schedule": {"type": "once", "value": args.when, "timezone": tz_name},
-        "next_run_at": _iso(when),
+        "schedule": {
+            "type": "once",
+            "value": args.when,
+            "timezone": tz_name,
+            "offset_minutes": args.offset_minutes,
+        },
+        "event_at": _iso(when),
+        "next_run_at": _iso(fire_at),
         "channels": [],
         "backend_refs": {},
         "created_at": _iso(_utc_now()),
@@ -298,6 +305,12 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("create", help="Create a reminder")
     c.add_argument("--title", required=True)
     c.add_argument("--when", required=True, help="YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    c.add_argument(
+        "--offset-minutes",
+        type=int,
+        default=0,
+        help="Offset minutes for notification time: -10 means 10 minutes early; 0 on time; +10 late",
+    )
     c.add_argument("--notes", default="")
     c.add_argument("--mirror", choices=["none", "apple"], default="none")
     c.add_argument("--notify", choices=["none", "stdout"], default="stdout")
