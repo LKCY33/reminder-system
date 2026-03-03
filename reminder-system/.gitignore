@@ -1,0 +1,13 @@
+# Local state (contains personal routing targets)
+data/state.json
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

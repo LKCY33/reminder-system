@@ -16,6 +16,7 @@ It keeps reminders in a local JSON file (source of truth), optionally mirrors th
   - Apple Reminders (via `remindctl`) as a mirror
   - Chat notification (initially: print payload; integrate with OpenClaw messaging at the call site)
 - Scheduler model: a periodic job calls `scripts/scheduler_lookahead.py` to pre-schedule one-shot jobs, and the one-shot jobs trigger notifications.
+- Cron execution contract: agent cron jobs use a message prefix `__CRON_EXEC__ <cmd>`, defined in workspace `BOOT.md`, which instructs the agent to execute `<cmd>` locally via `exec`.
 
 ## Quick Start
 

@@ -35,6 +35,21 @@ def _load_state(path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
+def _defaults_route(state: Dict[str, Any]) -> Dict[str, str]:
+    defaults = state.get("defaults") or {}
+    route = defaults.get("route") if isinstance(defaults, dict) else None
+    if isinstance(route, dict):
+        out: Dict[str, str] = {}
+        ch = route.get("channel")
+        tgt = route.get("target")
+        if ch:
+            out["channel"] = ch
+        if tgt:
+            out["target"] = tgt
+        return out
+    return {}
+
+
 def _find_route(state: Dict[str, Any], rid: str) -> Dict[str, str]:
     for r in state.get("reminders", []):
         if r.get("id") == rid:
@@ -51,26 +66,24 @@ def _find_route(state: Dict[str, Any], rid: str) -> Dict[str, str]:
     return {}
 
 
-def _format_payload(payload: Dict[str, Any]) -> str:
-    title = payload.get("title") or "(no title)"
-    rid = payload.get("id")
-    due_local = payload.get("due_local") or payload.get("due")
-    now_local = payload.get("now_local") or payload.get("now")
-    tz = payload.get("timezone")
-    notes = payload.get("notes") or ""
+def _format_payload(payload: Dict[str, Any], *, target: str) -> str:
+    # Template fields (confirmed): eventTitle/time/target/content/source
+    event_title = payload.get("title") or "(no title)"
+    time_val = payload.get("due_local") or payload.get("due") or ""
+    notes = (payload.get("notes") or "").strip()
 
-    lines = [
-        "提醒到期",
-        f"- 标题: {title}",
-        f"- 到期: {due_local}" + (f" ({tz})" if tz else ""),
-        f"- 现在: {now_local}" + (f" ({tz})" if tz else ""),
-    ]
-    if rid:
-        lines.append(f"- id: {rid}")
-    if notes.strip():
-        lines.append("- 备注:")
-        lines.append(notes.strip())
-    return "\n".join(lines)
+    content = notes
+    source = "reminder-system"
+
+    return "\n".join(
+        [
+            f"【{event_title}】",
+            f"时间：{time_val}",
+            f"对象：{target}",
+            f"内容：{content}",
+            f"来源：{source}",
+        ]
+    )
 
 
 def main(argv: List[str]) -> int:
@@ -80,26 +93,28 @@ def main(argv: List[str]) -> int:
         default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"),
         help="Path to state.json",
     )
-    ap.add_argument("--channel", default="feishu", help="Fallback channel if reminder has no route")
+    ap.add_argument("--channel", default=None, help="Fallback channel if reminder has no route")
     ap.add_argument(
         "--target",
-        default="user:ou_4da26eb40cfb44caee9ad41074668bba",
+        default=None,
         help="Fallback target if reminder has no route",
     )
+    ap.add_argument("--id", dest="rid", default=None, help="Only process a specific reminder id")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
     state = _load_state(args.state)
 
     cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "reminder_system.py"), "--state", args.state, "run-due"]
+    if args.rid:
+        cmd += ["--id", args.rid]
     p = _run(cmd)
     if p.returncode != 0:
         print(p.stderr, file=sys.stderr)
         return p.returncode
 
+    # reminder_system prints a final JSON summary: { fired: [...], count: N }
     fired: List[Dict[str, Any]] = []
-
-    # reminder_system prints optional per-reminder lines + a final JSON summary.
     for line in p.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -108,19 +123,29 @@ def main(argv: List[str]) -> int:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if obj.get("type") == "reminder_due":
-            fired.append(obj.get("payload") or {})
+        if isinstance(obj.get("fired"), list):
+            fired = obj.get("fired")
+            break
 
     if not fired:
         return 0
 
     for payload in fired:
-        msg = _format_payload(payload)
-
         rid = payload.get("id")
+        if args.rid and rid != args.rid:
+            continue
+
         route = _find_route(state, rid) if rid else {}
-        channel = route.get("channel") or args.channel
-        target = route.get("target") or args.target
+        defaults_route = _defaults_route(state)
+
+        channel = route.get("channel") or args.channel or defaults_route.get("channel")
+        target = route.get("target") or args.target or defaults_route.get("target")
+
+        if not channel or not target:
+            print(f"missing route for reminder id={rid}", file=sys.stderr)
+            return 2
+
+        msg = _format_payload(payload, target=target)
 
         if args.dry_run:
             print(json.dumps({"channel": channel, "target": target, "message": msg}, ensure_ascii=False))

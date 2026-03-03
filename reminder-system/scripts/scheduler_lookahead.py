@@ -47,7 +47,18 @@ def _ensure_job_index(state: Dict[str, Any]) -> Dict[str, Any]:
     return idx
 
 
-def _add_one_shot(job_name: str, at_iso: str, system_event: str) -> Optional[str]:
+def _add_one_shot(job_name: str, at_iso: str, rid: str, state_path: str) -> Optional[str]:
+    # Use an agentTurn payload so execution does not depend on hooks/systemEvent routing.
+    # The BOOT.md contract makes __CRON_EXEC__ execute via exec.
+    msg = (
+        "__CRON_EXEC__ /usr/bin/python3 "
+        + os.path.join(os.path.dirname(__file__), "run_due_and_notify.py")
+        + " --state "
+        + state_path
+        + " --id "
+        + rid
+    )
+
     cmd = [
         "openclaw",
         "cron",
@@ -61,19 +72,25 @@ def _add_one_shot(job_name: str, at_iso: str, system_event: str) -> Optional[str
         "--wake",
         "now",
         "--delete-after-run",
-        "--system-event",
-        system_event,
+        "--light-context",
+        "--expect-final",
+        "--timeout-seconds",
+        "120",
+        "--message",
+        msg,
+        "--no-deliver",
         "--json",
     ]
     p = _run(cmd)
     if p.returncode != 0:
+        print(p.stderr, file=sys.stderr)
         return None
     try:
         j = json.loads(p.stdout)
-        # Shape is tool-dependent; keep best-effort.
         return j.get("jobId") or j.get("id")
     except Exception:
-        return None
+        # Even if JSON parsing fails, the job may still have been created.
+        return "created"
 
 
 def main(argv: List[str]) -> int:
@@ -128,16 +145,10 @@ def main(argv: List[str]) -> int:
             continue
 
         job_name = f"reminder-fire-{rid[:8]}"
-        route = r.get("route") if isinstance(r.get("route"), dict) else None
-        system_event = {"type": "reminder_fire", "id": rid}
-        if route:
-            system_event["route"] = route
-        system_event = json.dumps(system_event, ensure_ascii=False)
-
         planned.append({"id": rid, "at": next_run_at, "job_name": job_name})
 
         if not args.dry_run:
-            job_id = _add_one_shot(job_name, next_run_at, system_event)
+            job_id = _add_one_shot(job_name, next_run_at, rid, args.state)
             idx[rid] = {"at": next_run_at, "job_id": job_id, "status": "scheduled", "created_at": now.isoformat()}
 
     if not args.dry_run:

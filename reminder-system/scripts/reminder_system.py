@@ -278,6 +278,8 @@ def cmd_run_due(args: argparse.Namespace) -> int:
 
     fired: List[Dict[str, Any]] = []
     for r in state.get("reminders", []):
+        if args.id and r.get("id") != args.id:
+            continue
         if r.get("status") != "active":
             continue
         try:
@@ -363,6 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
     x.set_defaults(fn=cmd_cancel)
 
     r = sub.add_parser("run-due", help="Fire due reminders")
+    r.add_argument("--id", default=None, help="Only fire a specific reminder id")
     r.set_defaults(fn=cmd_run_due)
 
     return p
