@@ -68,7 +68,7 @@ def _add_one_shot(job_name: str, at_iso: str, rid: str, state_path: str) -> Opti
         "--at",
         at_iso,
         "--session",
-        "main",
+        "isolated",
         "--wake",
         "now",
         "--delete-after-run",
