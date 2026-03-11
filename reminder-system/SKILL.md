@@ -14,9 +14,25 @@ It keeps reminders in a local JSON file (source of truth), optionally mirrors th
 - Source of truth: `data/state.json`
 - Backends:
   - Apple Reminders (via `remindctl`) as a mirror
-  - Chat notification (initially: print payload; integrate with OpenClaw messaging at the call site)
+  - Chat notification via OpenClaw messaging as the current pragmatic delivery path
 - Scheduler model: a periodic job calls `scripts/scheduler_lookahead.py` to pre-schedule one-shot jobs, and the one-shot jobs trigger notifications.
 - Cron execution contract: agent cron jobs use a message prefix `__CRON_EXEC__ <cmd>`, defined in workspace `BOOT.md`, which instructs the agent to execute `<cmd>` locally via `exec`.
+
+## Operational Behavior
+
+### Path Behavior
+
+- By default, runtime paths resolve relative to the skill root.
+- The same relative layout is intended to work in both repository and installed-skill locations.
+- Most normal usage should not need `--state`.
+- Use `--state` when you explicitly want to point the skill at a different state file.
+- Wrapper scripts may also honor environment overrides such as `REMINDER_SYSTEM_ROOT` and `REMINDER_SYSTEM_STATE`.
+
+### Current Delivery Behavior
+
+- The reminder system currently includes a direct-send path via OpenClaw messaging.
+- This is a pragmatic working path, not the desired long-term architectural boundary.
+- Long-term direction: reminder orchestration should remain here, while generic notification delivery concerns may be handed to a dedicated delivery layer such as `notify`.
 
 ## Quick Start
 
@@ -61,12 +77,21 @@ python3 scripts/reminder_system.py cancel --id <id>
 
 ## Data Model (state.json)
 
-- Stored at `data/state.json`.
+- Stored at `data/state.json` by default.
 - Written atomically (temp + rename).
 - Minimal fields:
   - `id`, `title`, `notes`, `status`, `schedule`, `next_run_at`, `channels`, `backend_refs`
 
+## Dependencies
+
+Current expected runtime dependencies include:
+
+- `/usr/bin/python3`
+- `openclaw`
+- `remindctl` (only when Apple Reminders mirroring is used)
+
 ## Notes / Boundaries
 
 - Apple Reminders is treated as a mirror only; complex recurrence lives in `state.json`.
+- This skill owns reminder orchestration concerns, not generic notification-delivery governance.
 - Quiet hours and retry policies can be added later without changing the public CLI surface.
