@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -7,25 +9,12 @@ import subprocess
 import sys
 from typing import Any, Dict, List
 
+from notify_client import send_notification_request
+from notify_request_builder import build_notification_request
+
 
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-
-def _openclaw_message_send(text: str, channel: str, target: str) -> bool:
-    cmd = [
-        "openclaw",
-        "message",
-        "send",
-        "--channel",
-        channel,
-        "--target",
-        target,
-        "--message",
-        text,
-    ]
-    p = _run(cmd)
-    return p.returncode == 0
 
 
 def _load_state(path: str) -> Dict[str, Any]:
@@ -66,26 +55,6 @@ def _find_route(state: Dict[str, Any], rid: str) -> Dict[str, str]:
     return {}
 
 
-def _format_payload(payload: Dict[str, Any], *, target: str) -> str:
-    # Template fields (confirmed): eventTitle/time/target/content/source
-    event_title = payload.get("title") or "(no title)"
-    time_val = payload.get("due_local") or payload.get("due") or ""
-    notes = (payload.get("notes") or "").strip()
-
-    content = notes
-    source = "reminder-system"
-
-    return "\n".join(
-        [
-            f"【{event_title}】",
-            f"时间：{time_val}",
-            f"对象：{target}",
-            f"内容：{content}",
-            f"来源：{source}",
-        ]
-    )
-
-
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -94,11 +63,7 @@ def main(argv: List[str]) -> int:
         help="Path to state.json",
     )
     ap.add_argument("--channel", default=None, help="Fallback channel if reminder has no route")
-    ap.add_argument(
-        "--target",
-        default=None,
-        help="Fallback target if reminder has no route",
-    )
+    ap.add_argument("--target", default=None, help="Fallback target if reminder has no route")
     ap.add_argument("--id", dest="rid", default=None, help="Only process a specific reminder id")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -113,7 +78,6 @@ def main(argv: List[str]) -> int:
         print(p.stderr, file=sys.stderr)
         return p.returncode
 
-    # reminder_system prints a final JSON summary: { fired: [...], count: N }
     fired: List[Dict[str, Any]] = []
     for line in p.stdout.splitlines():
         line = line.strip()
@@ -130,6 +94,8 @@ def main(argv: List[str]) -> int:
     if not fired:
         return 0
 
+    results: List[Dict[str, Any]] = []
+
     for payload in fired:
         rid = payload.get("id")
         if args.rid and rid != args.rid:
@@ -145,17 +111,30 @@ def main(argv: List[str]) -> int:
             print(f"missing route for reminder id={rid}", file=sys.stderr)
             return 2
 
-        msg = _format_payload(payload, target=target)
+        req = build_notification_request(payload, channel=channel, target=target)
 
         if args.dry_run:
-            print(json.dumps({"channel": channel, "target": target, "message": msg}, ensure_ascii=False))
+            print(json.dumps(req, ensure_ascii=False))
             continue
 
-        ok = _openclaw_message_send(msg, channel, target)
-        if not ok:
-            print("failed to send message", file=sys.stderr)
+        result = send_notification_request(req)
+        results.append(result)
+
+        status = result.get("status")
+        if status in ("success", "duplicate"):
+            continue
+        if status == "invalid_request":
+            print(json.dumps(result, ensure_ascii=False), file=sys.stderr)
+            return 3
+        if status == "delivery_failed":
+            print(json.dumps(result, ensure_ascii=False), file=sys.stderr)
             return 1
 
+        print(json.dumps({"status": "delivery_failed", "reason": f"unknown notify status: {status}"}, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    if results:
+        print(json.dumps({"results": results, "count": len(results)}, ensure_ascii=False))
     return 0
 
 
