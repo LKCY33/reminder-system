@@ -46,8 +46,41 @@ It should not assume that repository-only paths are permanent runtime truth.
 
 - `SKILL.md` — operational behavior of the skill itself
 - `development-system/repositories/reminder-system-install-readiness.md` — install-readiness tracking
+- `development-system/repositories/reminder-system-install-validation-plan.md` — install-validation execution plan
+- `development-system/repositories/reminder-system-validation-stage-architecture-decision.md` — validation stage architecture and layering rationale
 - `development-system/repositories/reminder-system-roadmap.md` — repository/skill evolution roadmap
 - `development-system/repositories/notify-vs-reminder-system-boundary.md` — delivery/orchestration boundary
+
+## Validation Entry Point
+
+The repository now includes a fixed install-validation entrypoint:
+
+- `scripts/install_validation.py`
+
+Current intent:
+
+- use `self-check` and `preinstall` as higher-frequency repository-side validation layers
+- use `install-copy-check` as an install-shaped artifact validation layer
+- use `skills-install-check` as the real `skills/`-layer non-live validation layer
+- treat `live-e2e` as a later explicit confidence stage rather than a default validation step
+
+This keeps validation layered instead of collapsing everything into one deployment-like action.
+
+### How To Use The Entry Point
+
+Use stage-local modes when you only need a local or incremental validation step:
+
+- `python3 scripts/install_validation.py self-check`
+- `python3 scripts/install_validation.py preinstall`
+- `python3 scripts/install_validation.py install-copy-check`
+- `python3 scripts/install_validation.py skills-install-check`
+
+Use `full` when you need one complete non-live readiness-review run:
+
+- `python3 scripts/install_validation.py full`
+
+`full` is the canonical non-live readiness-review command.
+Stage-local runs are useful for debugging and iteration, but they are not the same thing as a full install-readiness conclusion.
 
 ## Current State
 

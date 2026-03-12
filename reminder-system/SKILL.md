@@ -90,6 +90,25 @@ Current expected runtime dependencies include:
 - `openclaw`
 - `remindctl` (only when Apple Reminders mirroring is used)
 
+## Validation
+
+Repository-side install validation is now expected to run through:
+
+- `scripts/install_validation.py`
+
+Current validation layering:
+
+- `self-check` — structural sanity check
+- `preinstall` — repository-mode behavior validation with isolated state
+- `install-copy-check` — copied install-artifact validation
+- `skills-install-check` — real `skills/` target validation
+
+Validation run semantics:
+
+- stage-local modes are for local or incremental validation only
+- `full` is the canonical non-live readiness-review run
+- `live-e2e` remains a later explicit real scheduling / delivery confidence validation layer
+
 ## Notes / Boundaries
 
 - Apple Reminders is treated as a mirror only; complex recurrence lives in `state.json`.
