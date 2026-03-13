@@ -686,10 +686,10 @@ class ValidationRunner:
                 try:
                     handoff_out = self._parse_json_output(p3.stdout)
                     results = handoff_out.get("results") or []
-                    if results and results[0].get("status") == "success":
+                    if results and results[0].get("status") == "success" and handoff_out.get("any_failure") is False:
                         stage.add("skills-handoff-success", "pass", "installed-to-installed handoff returned success")
                     else:
-                        stage.add("skills-handoff-success", "fail", "handoff run did not report success", {"output": handoff_out})
+                        stage.add("skills-handoff-success", "fail", "handoff run did not report clean success", {"output": handoff_out})
                 except Exception as e:
                     stage.add("skills-handoff-success", "fail", f"handoff success output parse failed: {e}")
             else:
@@ -759,7 +759,7 @@ class ValidationRunner:
                             try:
                                 dup_out = self._parse_json_output(p5.stdout)
                                 dup_results = dup_out.get("results") or []
-                                if dup_results and dup_results[0].get("status") == "duplicate":
+                                if dup_results and dup_results[0].get("status") == "duplicate" and dup_out.get("any_failure") is False:
                                     stage.add("skills-handoff-duplicate", "pass", "installed-to-installed handoff returned duplicate when dedupe key already existed")
                                 else:
                                     stage.add("skills-handoff-duplicate", "fail", "handoff duplicate path did not report duplicate", {"output": dup_out})
@@ -773,6 +773,62 @@ class ValidationRunner:
                     stage.add("skills-handoff-duplicate", "fail", "failed to build real duplicate dry-run request")
             else:
                 stage.add("skills-handoff-duplicate", "fail", "failed to create duplicate test reminder")
+
+        mixed_state = self.artifacts_dir / "skills-install-mixed-state.json"
+        self._write_seed_state(mixed_state)
+        mixed_when = (datetime.now().astimezone() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
+        mixed_ids: List[str] = []
+        for title, notes in [
+            ("skills-install-mixed-success", "mixed batch success reminder"),
+            ("skills-install-mixed-invalid-request", "mixed batch invalid request reminder"),
+        ]:
+            create_mixed_cmd = [
+                self.py, str(reminder_script), "--state", str(mixed_state), "create",
+                "--title", title,
+                "--when", mixed_when,
+                "--offset-minutes", "0",
+                "--notes", notes,
+                "--notify", "stdout",
+                "--route-channel", self.args.default_channel,
+                "--route-target", self.args.default_target,
+            ]
+            p_mixed = self.run_cmd(create_mixed_cmd)
+            lines.append("[handoff-mixed-create]")
+            lines.append("$ " + " ".join(create_mixed_cmd))
+            lines.append(p_mixed.stdout)
+            lines.append(p_mixed.stderr)
+            if p_mixed.returncode != 0:
+                stage.add("skills-handoff-mixed", "fail", "failed to create mixed batch reminders")
+                stage.log_file = self.write_stage_log(stage.id, lines)
+                return stage
+            mixed_created = self._parse_json_output(p_mixed.stdout)
+            mixed_ids.append(str(mixed_created.get("id")))
+
+        mixed_failure_id = mixed_ids[1]
+        mixed_env = dict(handoff_env)
+        mixed_env["REMINDER_NOTIFY_INJECT_FAILURE_FOR_ID"] = mixed_failure_id
+        mixed_env["REMINDER_NOTIFY_INJECT_FAILURE_STATUS"] = "invalid_request"
+        mixed_env["REMINDER_NOTIFY_INJECT_FAILURE_REASON"] = "validation-only injected invalid request"
+
+        mixed_cmd = [self.py, str(run_due_script), "--state", str(mixed_state)]
+        p_mixed_run = self.run_cmd(mixed_cmd, env=mixed_env)
+        lines.append("[handoff-mixed-run]")
+        lines.append("$ " + " ".join(mixed_cmd))
+        lines.append(p_mixed_run.stdout)
+        lines.append(p_mixed_run.stderr)
+        if p_mixed_run.returncode != 1:
+            stage.add("skills-handoff-mixed", "fail", "mixed batch should exit non-zero when any item fails", {"returncode": p_mixed_run.returncode})
+        else:
+            try:
+                mixed_out = self._parse_json_output(p_mixed_run.stdout)
+                mixed_results = mixed_out.get("results") or []
+                statuses = {str(item.get("status")) for item in mixed_results}
+                if mixed_out.get("any_failure") is True and "success" in statuses and ("invalid_request" in statuses or "delivery_failed" in statuses or "route_failed" in statuses):
+                    stage.add("skills-handoff-mixed", "pass", "mixed batch continued after failure and reported combined summary", {"counts": mixed_out.get("counts")})
+                else:
+                    stage.add("skills-handoff-mixed", "fail", "mixed batch summary did not preserve both success and failure outcomes", {"output": mixed_out})
+            except Exception as e:
+                stage.add("skills-handoff-mixed", "fail", f"mixed batch output parse failed: {e}")
 
         stage.log_file = self.write_stage_log(stage.id, lines)
         return stage

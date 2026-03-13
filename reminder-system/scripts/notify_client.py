@@ -75,7 +75,46 @@ def explain_notify_resolution() -> Dict[str, Any]:
     }
 
 
+def _maybe_inject_failure(req: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    target_id = os.environ.get("REMINDER_NOTIFY_INJECT_FAILURE_FOR_ID")
+    target_dedupe = os.environ.get("REMINDER_NOTIFY_INJECT_FAILURE_FOR_DEDUPE_KEY")
+    status = os.environ.get("REMINDER_NOTIFY_INJECT_FAILURE_STATUS")
+    reason = os.environ.get("REMINDER_NOTIFY_INJECT_FAILURE_REASON") or "validation-only injected failure"
+
+    if not status:
+        return None
+
+    req_dedupe = str(req.get("dedupe_key") or "")
+    reminder_id = None
+    metadata = req.get("metadata")
+    if isinstance(metadata, dict):
+        reminder_id = metadata.get("reminder_id")
+
+    matched = False
+    if target_id and reminder_id and str(reminder_id) == target_id:
+        matched = True
+    if target_dedupe and req_dedupe == target_dedupe:
+        matched = True
+
+    if not matched:
+        return None
+
+    if status not in ("invalid_request", "delivery_failed"):
+        status = "delivery_failed"
+
+    return {
+        "status": status,
+        "event_id": req.get("event_id"),
+        "dedupe_key": req.get("dedupe_key"),
+        "reason": reason,
+    }
+
+
 def send_notification_request(req: Dict[str, Any]) -> Dict[str, Any]:
+    injected = _maybe_inject_failure(req)
+    if injected is not None:
+        return injected
+
     fd, tmp = tempfile.mkstemp(prefix="notification-request.", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

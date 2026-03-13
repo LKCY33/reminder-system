@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from completion_utils import mark_completed
 from notify_client import send_notification_request
@@ -54,6 +54,32 @@ def _find_route(state: Dict[str, Any], rid: str) -> Dict[str, str]:
                     out["target"] = tgt
                 return out
     return {}
+
+
+def _build_route_failure(reminder_id: Any, reason: str) -> Dict[str, Any]:
+    return {
+        "status": "route_failed",
+        "reminder_id": reminder_id,
+        "reason": reason,
+    }
+
+
+def _append_result(results: List[Dict[str, Any]], result: Dict[str, Any], reminder_id: Any, completed: bool = False) -> None:
+    entry = dict(result)
+    entry["reminder_id"] = reminder_id
+    entry["completed"] = completed
+    results.append(entry)
+
+
+def _summarize(results: List[Dict[str, Any]]) -> Tuple[Dict[str, int], bool]:
+    counts: Dict[str, int] = {}
+    any_failure = False
+    for result in results:
+        status = str(result.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+        if status not in ("success", "duplicate"):
+            any_failure = True
+    return counts, any_failure
 
 
 def main(argv: List[str]) -> int:
@@ -103,8 +129,8 @@ def main(argv: List[str]) -> int:
         target = route.get("target") or args.target or defaults_route.get("target")
 
         if not channel or not target:
-            print(f"missing route for reminder id={rid}", file=sys.stderr)
-            return 2
+            _append_result(results, _build_route_failure(rid, "missing route"), rid, completed=False)
+            continue
 
         req = build_notification_request(payload, channel=channel, target=target)
 
@@ -113,25 +139,35 @@ def main(argv: List[str]) -> int:
             continue
 
         result = send_notification_request(req)
-        results.append(result)
         status = result.get("status")
 
         if status in ("success", "duplicate"):
-            if rid:
-                mark_completed(args.state, rid)
+            completed = bool(rid and mark_completed(args.state, rid))
+            _append_result(results, result, rid, completed=completed)
             continue
-        if status == "invalid_request":
-            print(json.dumps(result, ensure_ascii=False), file=sys.stderr)
-            return 3
-        if status == "delivery_failed":
-            print(json.dumps(result, ensure_ascii=False), file=sys.stderr)
-            return 1
 
-        print(json.dumps({"status": "delivery_failed", "reason": f"unknown notify status: {status}"}, ensure_ascii=False), file=sys.stderr)
-        return 1
+        if status in ("invalid_request", "delivery_failed"):
+            _append_result(results, result, rid, completed=False)
+            continue
+
+        unknown = {
+            "status": "delivery_failed",
+            "reason": f"unknown notify status: {status}",
+            "event_id": result.get("event_id"),
+            "dedupe_key": result.get("dedupe_key"),
+        }
+        _append_result(results, unknown, rid, completed=False)
 
     if results:
-        print(json.dumps({"results": results, "count": len(results)}, ensure_ascii=False))
+        counts, any_failure = _summarize(results)
+        summary = {
+            "results": results,
+            "count": len(results),
+            "counts": counts,
+            "any_failure": any_failure,
+        }
+        print(json.dumps(summary, ensure_ascii=False))
+        return 1 if any_failure else 0
     return 0
 
 
