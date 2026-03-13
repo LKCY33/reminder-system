@@ -31,6 +31,12 @@ Preferred model:
 - allow explicit overrides when needed
 - do not make core runtime behavior depend on whether the code lives under `repositories/` or `skills/`
 
+Current notify handoff path resolution is intended to follow this same rule:
+
+- first honor explicit overrides such as `NOTIFY_EXECUTOR` or `NOTIFY_ROOT`
+- then prefer a colocated installed-skill path under `skills/`
+- finally fall back to the repository development copy of `notify`
+
 ## Repository Responsibilities
 
 This repository should contain:

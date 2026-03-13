@@ -30,9 +30,13 @@ It keeps reminders in a local JSON file (source of truth), optionally mirrors th
 
 ### Current Delivery Behavior
 
-- The reminder system currently includes a direct-send path via OpenClaw messaging.
-- This is a pragmatic working path, not the desired long-term architectural boundary.
-- Long-term direction: reminder orchestration should remain here, while generic notification delivery concerns may be handed to a dedicated delivery layer such as `notify`.
+- The reminder system currently hands due-notification execution to `notify` through a small client boundary.
+- The runtime resolution strategy is:
+  - honor `NOTIFY_EXECUTOR` if set
+  - else honor `NOTIFY_ROOT` if set
+  - else prefer a colocated installed-skill path under `skills/notify`
+  - else fall back to the repository development copy under `repositories/notify`
+- Long-term direction remains the same: reminder orchestration stays here, while generic notification delivery concerns live in `notify`.
 
 ## Quick Start
 

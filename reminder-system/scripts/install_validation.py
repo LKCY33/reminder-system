@@ -2,10 +2,12 @@
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -114,8 +116,8 @@ class ValidationRunner:
             }
         )
 
-    def run_cmd(self, cmd: List[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
-        return subprocess.run(cmd, cwd=str(cwd) if cwd else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    def run_cmd(self, cmd: List[str], cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     def _write_seed_state(self, path: Path) -> None:
         state = {
@@ -147,6 +149,37 @@ class ValidationRunner:
         if dst.exists():
             shutil.rmtree(dst)
         shutil.copytree(self.skill_root, dst, ignore=shutil.ignore_patterns("logs", "__pycache__", "*.pyc", ".DS_Store"))
+
+    def _workspace_root(self) -> Path:
+        return self.skill_root.parents[2]
+
+    def _skills_root(self) -> Path:
+        return self._workspace_root() / "skills"
+
+    def _prepare_notify_skill_target(self) -> Path:
+        source = self._workspace_root() / "repositories" / "notify"
+        target = self._skills_root() / "notify"
+        if not source.exists():
+            raise FileNotFoundError(f"notify repository not found at {source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target, ignore=shutil.ignore_patterns("logs", "__pycache__", "*.pyc", ".DS_Store"))
+        return target
+
+    def _write_notify_test_request(self, path: Path, dedupe_key: str) -> None:
+        payload = {
+            "source": "reminder-system-install-validation",
+            "kind": "handoff_test",
+            "event_id": f"evt:{dedupe_key}",
+            "dedupe_key": dedupe_key,
+            "channel": self.args.default_channel,
+            "target": self.args.default_target,
+            "title": "handoff validation",
+            "body": "installed-to-installed handoff validation",
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def stage_self_check(self) -> StageResult:
         stage = StageResult(id="self-check")
@@ -222,6 +255,33 @@ class ValidationRunner:
             stage.add("dependencies", "pass", "required dependencies available", {"resolved": deps})
         lines.append("[dependencies]")
         lines.append(json.dumps(deps, ensure_ascii=False))
+
+        notify_env = os.environ.copy()
+        notify_env["PYTHONPATH"] = str(self.scripts_dir) + (os.pathsep + notify_env["PYTHONPATH"] if notify_env.get("PYTHONPATH") else "")
+        notify_probe = self.run_cmd(
+            [
+                self.py,
+                "-c",
+                "import json; from notify_client import explain_notify_resolution; print(json.dumps(explain_notify_resolution(), ensure_ascii=False))",
+            ],
+            cwd=self.scripts_dir,
+            env=notify_env,
+        )
+        lines.append("[notify-resolution]")
+        lines.append(notify_probe.stdout)
+        lines.append(notify_probe.stderr)
+        if notify_probe.returncode != 0:
+            stage.add("notify-resolution", "fail", "failed to inspect notify executor resolution")
+        else:
+            try:
+                notify_info = self._parse_json_output(notify_probe.stdout)
+                resolved = notify_info.get("resolved")
+                if resolved:
+                    stage.add("notify-resolution", "pass", "notify executor resolved", {"resolved": resolved, "searched": notify_info.get("searched")})
+                else:
+                    stage.add("notify-resolution", "fail", "notify executor did not resolve", {"details": notify_info})
+            except Exception as e:
+                stage.add("notify-resolution", "fail", f"notify resolution output parse failed: {e}")
 
         stage.log_file = self.write_stage_log(stage.id, lines)
         return stage
@@ -486,7 +546,7 @@ class ValidationRunner:
         stage = StageResult(id="skills-install-check")
         lines: List[str] = []
 
-        skills_root = self.skill_root.parents[2] / "skills"
+        skills_root = self._skills_root()
         skills_root.mkdir(parents=True, exist_ok=True)
         target_name = self.args.skills_target_name or f"reminder-system-validation-{self.run_id}"
         skills_target = skills_root / target_name
@@ -494,8 +554,11 @@ class ValidationRunner:
             shutil.rmtree(skills_target)
         shutil.copytree(self.skill_root, skills_target, ignore=shutil.ignore_patterns("logs", "__pycache__", "*.pyc", ".DS_Store"))
 
+        notify_target = self._prepare_notify_skill_target()
+
         self.summary["artifacts"]["skillsInstallRoot"] = str(skills_target)
         self.summary["artifacts"]["skillsInstallCleanupPlanned"] = bool(self.args.cleanup_skills_install)
+        self.summary["artifacts"]["skillsNotifyRoot"] = str(notify_target)
 
         reminder_script = skills_target / "scripts" / "reminder_system.py"
         run_due_script = skills_target / "scripts" / "run_due_and_notify.py"
@@ -553,6 +616,7 @@ class ValidationRunner:
         lines.append("$ " + " ".join(create_due_cmd))
         lines.append(p.stdout)
         lines.append(p.stderr)
+        due_id = None
         if p.returncode != 0:
             stage.add("skills-install-create-due", "fail", "failed to create real skills-target due sample")
         else:
@@ -584,6 +648,131 @@ class ValidationRunner:
             stage.add("skills-install-cron-target", "fail", "skills-install expected cron target unexpectedly equals repository script path")
         else:
             stage.add("skills-install-cron-target", "pass", "skills-install expected cron target differs from repository script path")
+
+        handoff_env = os.environ.copy()
+        handoff_env["PYTHONPATH"] = str(skills_target / "scripts") + (os.pathsep + handoff_env["PYTHONPATH"] if handoff_env.get("PYTHONPATH") else "")
+        handoff_env["NOTIFY_TEST_MODE"] = "success"
+        handoff_env["NOTIFY_DEDUPE_PATH"] = str(self.artifacts_dir / "handoff-notify-dedupe.txt")
+
+        resolution_probe = self.run_cmd(
+            [self.py, "-c", "import json; from notify_client import explain_notify_resolution; print(json.dumps(explain_notify_resolution(), ensure_ascii=False))"],
+            cwd=skills_target / "scripts",
+            env=handoff_env,
+        )
+        lines.append("[handoff-resolution]")
+        lines.append(resolution_probe.stdout)
+        lines.append(resolution_probe.stderr)
+        if resolution_probe.returncode != 0:
+            stage.add("skills-handoff-resolution", "fail", "failed to inspect installed-to-installed notify resolution")
+        else:
+            try:
+                info = self._parse_json_output(resolution_probe.stdout)
+                resolved = info.get("resolved")
+                if resolved == str(notify_target / "run" / "execute-request.py"):
+                    stage.add("skills-handoff-resolution", "pass", "installed reminder-system resolved installed notify", {"resolved": resolved})
+                else:
+                    stage.add("skills-handoff-resolution", "fail", "installed reminder-system did not resolve installed notify", {"resolved": resolved, "searched": info.get("searched")})
+            except Exception as e:
+                stage.add("skills-handoff-resolution", "fail", f"handoff resolution parse failed: {e}")
+
+        if due_id:
+            run_cmd = [self.py, str(run_due_script), "--state", str(due_state), "--id", str(due_id)]
+            p3 = self.run_cmd(run_cmd, env=handoff_env)
+            lines.append("[handoff-success]")
+            lines.append("$ " + " ".join(run_cmd))
+            lines.append(p3.stdout)
+            lines.append(p3.stderr)
+            if p3.returncode == 0:
+                try:
+                    handoff_out = self._parse_json_output(p3.stdout)
+                    results = handoff_out.get("results") or []
+                    if results and results[0].get("status") == "success":
+                        stage.add("skills-handoff-success", "pass", "installed-to-installed handoff returned success")
+                    else:
+                        stage.add("skills-handoff-success", "fail", "handoff run did not report success", {"output": handoff_out})
+                except Exception as e:
+                    stage.add("skills-handoff-success", "fail", f"handoff success output parse failed: {e}")
+            else:
+                stage.add("skills-handoff-success", "fail", "installed-to-installed handoff command failed")
+
+            status_probe = self.run_cmd(
+                [self.py, "-c", f"from completion_utils import get_status; print(get_status(r'{due_state}', r'{due_id}'))"],
+                cwd=skills_target / "scripts",
+                env=handoff_env,
+            )
+            lines.append("[handoff-completion]")
+            lines.append(status_probe.stdout)
+            lines.append(status_probe.stderr)
+            if status_probe.returncode == 0 and status_probe.stdout.strip() == "completed":
+                stage.add("skills-handoff-completion", "pass", "success handoff marked reminder completed")
+            else:
+                stage.add("skills-handoff-completion", "fail", "success handoff did not mark reminder completed", {"stdout": status_probe.stdout.strip(), "stderr": status_probe.stderr.strip()})
+
+            self._write_seed_state(due_state)
+            recreate_due_cmd = [
+                self.py, str(reminder_script), "--state", str(due_state), "create",
+                "--title", "skills-install-due-duplicate",
+                "--when", due_when,
+                "--offset-minutes", "0",
+                "--notes", "skills install due duplicate reminder",
+                "--notify", "stdout",
+                "--route-channel", self.args.default_channel,
+                "--route-target", self.args.default_target,
+            ]
+            p4 = self.run_cmd(recreate_due_cmd)
+            lines.append("[handoff-duplicate-create]")
+            lines.append("$ " + " ".join(recreate_due_cmd))
+            lines.append(p4.stdout)
+            lines.append(p4.stderr)
+            if p4.returncode == 0:
+                recreated = self._parse_json_output(p4.stdout)
+                duplicate_due_id = recreated.get("id")
+                req_path = self.artifacts_dir / "handoff-duplicate-request.json"
+                self._write_notify_test_request(req_path, dedupe_key=f"reminder_due:{duplicate_due_id}:DUPLICATE")
+                predup_env = dict(handoff_env)
+                predup_env["PYTHONPATH"] = str(notify_target / "run") + (os.pathsep + predup_env["PYTHONPATH"] if predup_env.get("PYTHONPATH") else "")
+                notify_exec = notify_target / "run" / "execute-request.py"
+                predup = self.run_cmd([self.py, str(notify_exec), "--request-file", str(req_path)], cwd=notify_target, env=predup_env)
+                lines.append("[handoff-predup]")
+                lines.append(predup.stdout)
+                lines.append(predup.stderr)
+
+                real_req = self.run_cmd([self.py, str(run_due_script), "--state", str(due_state), "--id", str(duplicate_due_id), "--dry-run"], env=handoff_env)
+                lines.append("[handoff-duplicate-dry-run]")
+                lines.append(real_req.stdout)
+                lines.append(real_req.stderr)
+                if real_req.returncode == 0:
+                    try:
+                        req_payload = self._parse_json_output(real_req.stdout)
+                        dup_req_path = self.artifacts_dir / "handoff-duplicate-real-request.json"
+                        dup_req_path.write_text(json.dumps(req_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                        predup_real = self.run_cmd([self.py, str(notify_exec), "--request-file", str(dup_req_path)], cwd=notify_target, env=predup_env)
+                        lines.append("[handoff-predup-real]")
+                        lines.append(predup_real.stdout)
+                        lines.append(predup_real.stderr)
+
+                        p5 = self.run_cmd([self.py, str(run_due_script), "--state", str(due_state), "--id", str(duplicate_due_id)], env=handoff_env)
+                        lines.append("[handoff-duplicate]")
+                        lines.append(p5.stdout)
+                        lines.append(p5.stderr)
+                        if p5.returncode == 0:
+                            try:
+                                dup_out = self._parse_json_output(p5.stdout)
+                                dup_results = dup_out.get("results") or []
+                                if dup_results and dup_results[0].get("status") == "duplicate":
+                                    stage.add("skills-handoff-duplicate", "pass", "installed-to-installed handoff returned duplicate when dedupe key already existed")
+                                else:
+                                    stage.add("skills-handoff-duplicate", "fail", "handoff duplicate path did not report duplicate", {"output": dup_out})
+                            except Exception as e:
+                                stage.add("skills-handoff-duplicate", "fail", f"handoff duplicate output parse failed: {e}")
+                        else:
+                            stage.add("skills-handoff-duplicate", "fail", "installed-to-installed duplicate handoff command failed")
+                    except Exception as e:
+                        stage.add("skills-handoff-duplicate", "fail", f"failed to prepare real duplicate request: {e}")
+                else:
+                    stage.add("skills-handoff-duplicate", "fail", "failed to build real duplicate dry-run request")
+            else:
+                stage.add("skills-handoff-duplicate", "fail", "failed to create duplicate test reminder")
 
         stage.log_file = self.write_stage_log(stage.id, lines)
         return stage
