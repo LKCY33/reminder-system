@@ -9,6 +9,7 @@ import subprocess
 import sys
 from typing import Any, Dict, List
 
+from completion_utils import mark_completed
 from notify_client import send_notification_request
 from notify_request_builder import build_notification_request
 
@@ -57,11 +58,7 @@ def _find_route(state: Dict[str, Any], rid: str) -> Dict[str, str]:
 
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--state",
-        default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"),
-        help="Path to state.json",
-    )
+    ap.add_argument("--state", default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"), help="Path to state.json")
     ap.add_argument("--channel", default=None, help="Fallback channel if reminder has no route")
     ap.add_argument("--target", default=None, help="Fallback target if reminder has no route")
     ap.add_argument("--id", dest="rid", default=None, help="Only process a specific reminder id")
@@ -69,7 +66,6 @@ def main(argv: List[str]) -> int:
     args = ap.parse_args(argv)
 
     state = _load_state(args.state)
-
     cmd = [sys.executable, os.path.join(os.path.dirname(__file__), "reminder_system.py"), "--state", args.state, "run-due"]
     if args.rid:
         cmd += ["--id", args.rid]
@@ -103,7 +99,6 @@ def main(argv: List[str]) -> int:
 
         route = _find_route(state, rid) if rid else {}
         defaults_route = _defaults_route(state)
-
         channel = route.get("channel") or args.channel or defaults_route.get("channel")
         target = route.get("target") or args.target or defaults_route.get("target")
 
@@ -119,9 +114,11 @@ def main(argv: List[str]) -> int:
 
         result = send_notification_request(req)
         results.append(result)
-
         status = result.get("status")
+
         if status in ("success", "duplicate"):
+            if rid:
+                mark_completed(args.state, rid)
             continue
         if status == "invalid_request":
             print(json.dumps(result, ensure_ascii=False), file=sys.stderr)

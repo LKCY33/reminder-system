@@ -22,17 +22,9 @@ def _utc_now() -> datetime:
 
 
 def _local_tz_name() -> str:
-    # Determine an IANA timezone id.
-    #
-    # Order:
-    # 1) TZ env var (explicit override)
-    # 2) macOS /etc/localtime symlink target (stable and reflects System Settings)
-    # 3) fallback DEFAULT_TZ (Beijing)
-
     tz_env = os.environ.get("TZ")
     if tz_env:
         return tz_env
-
     try:
         target = os.path.realpath("/etc/localtime")
         marker = "/zoneinfo/"
@@ -40,20 +32,10 @@ def _local_tz_name() -> str:
             return target.split(marker, 1)[1]
     except Exception:
         pass
-
     return DEFAULT_TZ
 
 
 def _parse_when_local_to_utc(s: str, tz: ZoneInfo) -> datetime:
-    """Parse a local timestamp string and convert it to UTC.
-
-    Supported formats:
-    - YYYY-MM-DD HH:MM
-    - YYYY-MM-DD (interpreted as 00:00)
-
-    Ambiguous DST times are handled by Python's default fold=0 behavior.
-    """
-
     s = s.strip()
     parsed: Optional[datetime] = None
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
@@ -64,7 +46,6 @@ def _parse_when_local_to_utc(s: str, tz: ZoneInfo) -> datetime:
             continue
     if parsed is None:
         raise ValueError(f"Unsupported --when format: {s!r}")
-
     local_dt = parsed.replace(tzinfo=tz)
     return local_dt.astimezone(timezone.utc)
 
@@ -86,15 +67,12 @@ def _load_state(path: str) -> Dict[str, Any]:
         }
     with open(path, "r", encoding="utf-8") as f:
         state = json.load(f)
-
-    # Backfill defaults for existing state files.
     defaults = state.get("defaults")
     if not isinstance(defaults, dict):
         defaults = {}
         state["defaults"] = defaults
     defaults.setdefault("lookahead_minutes", 60)
     defaults.setdefault("offset_minutes", -10)
-
     return state
 
 
@@ -120,20 +98,12 @@ def _run(cmd: List[str]) -> subprocess.CompletedProcess:
 
 
 def _mirror_apple(title: str, notes: str) -> Optional[str]:
-    """Best-effort mirror into Apple Reminders.
-
-    Returns a backend id if we can extract one; otherwise None.
-    """
-
     cmd = ["remindctl", "add", "--title", title]
     if notes:
         cmd += ["--notes", notes]
-
     p = _run(cmd)
     if p.returncode != 0:
         return None
-
-    # remindctl prints a human line; treat id extraction as optional.
     return None
 
 
@@ -159,18 +129,14 @@ def _find(state: Dict[str, Any], rid: str) -> Optional[Dict[str, Any]]:
 def cmd_create(args: argparse.Namespace) -> int:
     state_path = args.state
     state = _load_state(state_path)
-
     rid = str(uuid.uuid4())
     tz_name = _local_tz_name()
     tz = ZoneInfo(tz_name)
     when = _parse_when_local_to_utc(args.when, tz)
-
     defaults = state.get("defaults") or {}
     default_offset = defaults.get("offset_minutes", -10)
     offset_minutes = args.offset_minutes if args.offset_minutes is not None else int(default_offset)
-
     fire_at = when + timedelta(minutes=offset_minutes)
-
     reminder: Dict[str, Any] = {
         "id": rid,
         "title": args.title,
@@ -193,18 +159,14 @@ def cmd_create(args: argparse.Namespace) -> int:
         "created_at": _iso(_utc_now()),
         "updated_at": _iso(_utc_now()),
     }
-
     if args.mirror == "apple":
         reminder["channels"].append("apple_reminders")
         apple_id = _mirror_apple(reminder["title"], reminder["notes"])
         reminder["backend_refs"]["apple_reminders"] = {"id": apple_id}
-
     if args.notify == "stdout":
         reminder["channels"].append("chat_stdout")
-
     state["reminders"].append(reminder)
     _atomic_write_json(state_path, state)
-
     print(json.dumps({"id": rid, "next_run_at": reminder["next_run_at"]}, ensure_ascii=False))
     return 0
 
@@ -217,12 +179,9 @@ def cmd_list(args: argparse.Namespace) -> int:
     state = _load_state(args.state)
     tz_name = _local_tz_name()
     tz = ZoneInfo(tz_name)
-
     reminders = state.get("reminders", [])
     if args.status:
         reminders = [r for r in reminders if r.get("status") == args.status]
-
-    # Add human-friendly local timestamps without changing the stored source of truth.
     out: List[Dict[str, Any]] = []
     for r in reminders:
         rr = dict(r)
@@ -233,7 +192,6 @@ def cmd_list(args: argparse.Namespace) -> int:
         except Exception:
             pass
         out.append(rr)
-
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
 
@@ -244,17 +202,14 @@ def cmd_snooze(args: argparse.Namespace) -> int:
     if not r:
         print(f"not found: {args.id}", file=sys.stderr)
         return 2
-
     try:
         cur = datetime.fromisoformat(r["next_run_at"].replace("Z", "+00:00"))
     except Exception:
         cur = _utc_now()
-
     dt = cur + timedelta(minutes=args.minutes)
     r["next_run_at"] = _iso(dt)
     r["updated_at"] = _iso(_utc_now())
     _atomic_write_json(args.state, state)
-
     print(json.dumps({"id": r["id"], "next_run_at": r["next_run_at"]}, ensure_ascii=False))
     return 0
 
@@ -275,7 +230,6 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 def cmd_run_due(args: argparse.Namespace) -> int:
     state = _load_state(args.state)
     now = _utc_now()
-
     fired: List[Dict[str, Any]] = []
     for r in state.get("reminders", []):
         if args.id and r.get("id") != args.id:
@@ -288,10 +242,8 @@ def cmd_run_due(args: argparse.Namespace) -> int:
             continue
         if due > now:
             continue
-
         tz_name = _local_tz_name()
         tz = ZoneInfo(tz_name)
-
         payload = {
             "id": r.get("id"),
             "title": r.get("title"),
@@ -302,53 +254,27 @@ def cmd_run_due(args: argparse.Namespace) -> int:
             "now": _iso(now),
             "now_local": _iso_local(now, tz),
         }
-
         if "chat_stdout" in (r.get("channels") or []):
             print(json.dumps({"type": "reminder_due", "payload": payload}, ensure_ascii=False))
-
-        # one-shot completion
-        r["status"] = "completed"
-        r["last_run_at"] = _iso(now)
-        r["updated_at"] = _iso(now)
         fired.append(payload)
-
-    _atomic_write_json(args.state, state)
     print(json.dumps({"fired": fired, "count": len(fired)}, ensure_ascii=False))
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="reminder-system")
-    p.add_argument(
-        "--state",
-        default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"),
-        help="Path to state.json (source of truth)",
-    )
-
+    p.add_argument("--state", default=os.path.join(os.path.dirname(__file__), "..", "data", "state.json"), help="Path to state.json (source of truth)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("create", help="Create a reminder")
     c.add_argument("--title", required=True)
     c.add_argument("--when", required=True, help="YYYY-MM-DD or YYYY-MM-DD HH:MM")
-    c.add_argument(
-        "--offset-minutes",
-        type=int,
-        default=None,
-        help="Offset minutes for notification time: -10 means 10 minutes early; 0 on time; +10 late. If omitted, uses state defaults.offset_minutes.",
-    )
+    c.add_argument("--offset-minutes", type=int, default=None, help="Offset minutes for notification time")
     c.add_argument("--notes", default="")
     c.add_argument("--mirror", choices=["none", "apple"], default="none")
     c.add_argument("--notify", choices=["none", "stdout"], default="stdout")
-    c.add_argument(
-        "--route-channel",
-        default="feishu",
-        help="Delivery channel for notifications (feishu|telegram|...)",
-    )
-    c.add_argument(
-        "--route-target",
-        default="user:ou_4da26eb40cfb44caee9ad41074668bba",
-        help="Delivery target for notifications (e.g. feishu user:.../chat:..., telegram chat id/@username)",
-    )
+    c.add_argument("--route-channel", default="feishu", help="Delivery channel for notifications")
+    c.add_argument("--route-target", default="user:ou_4da26eb40cfb44caee9ad41074668bba", help="Delivery target for notifications")
     c.set_defaults(fn=cmd_create)
 
     l = sub.add_parser("list", help="List reminders")
@@ -364,10 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--id", required=True)
     x.set_defaults(fn=cmd_cancel)
 
-    r = sub.add_parser("run-due", help="Fire due reminders")
+    r = sub.add_parser("run-due", help="Find due reminders without completing them")
     r.add_argument("--id", default=None, help="Only fire a specific reminder id")
     r.set_defaults(fn=cmd_run_due)
-
     return p
 
 
