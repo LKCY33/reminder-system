@@ -50,6 +50,24 @@ def _parse_when_local_to_utc(s: str, tz: ZoneInfo) -> datetime:
     return local_dt.astimezone(timezone.utc)
 
 
+def _parse_time_of_day(s: str) -> tuple[int, int]:
+    s = s.strip()
+    try:
+        parsed = datetime.strptime(s, "%H:%M")
+    except ValueError as e:
+        raise ValueError(f"Unsupported --time format: {s!r}") from e
+    return parsed.hour, parsed.minute
+
+
+def _next_daily_event_utc(reference_utc: datetime, *, time_str: str, tz: ZoneInfo) -> datetime:
+    hh, mm = _parse_time_of_day(time_str)
+    local_ref = reference_utc.astimezone(tz)
+    candidate = local_ref.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if candidate <= local_ref:
+        candidate = candidate + timedelta(days=1)
+    return candidate.astimezone(timezone.utc)
+
+
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -132,22 +150,40 @@ def cmd_create(args: argparse.Namespace) -> int:
     rid = str(uuid.uuid4())
     tz_name = _local_tz_name()
     tz = ZoneInfo(tz_name)
-    when = _parse_when_local_to_utc(args.when, tz)
     defaults = state.get("defaults") or {}
     default_offset = defaults.get("offset_minutes", -10)
     offset_minutes = args.offset_minutes if args.offset_minutes is not None else int(default_offset)
+
+    if args.schedule == "daily":
+        if not args.time:
+            raise ValueError("--time is required when --schedule daily")
+        if args.when is not None:
+            raise ValueError("--when is not allowed when --schedule daily")
+        when = _next_daily_event_utc(_utc_now(), time_str=args.time, tz=tz)
+        schedule: Dict[str, Any] = {
+            "type": "daily",
+            "time": args.time,
+            "timezone": tz_name,
+            "offset_minutes": offset_minutes,
+        }
+    else:
+        if not args.when:
+            raise ValueError("--when is required when --schedule once")
+        when = _parse_when_local_to_utc(args.when, tz)
+        schedule = {
+            "type": "once",
+            "value": args.when,
+            "timezone": tz_name,
+            "offset_minutes": offset_minutes,
+        }
+
     fire_at = when + timedelta(minutes=offset_minutes)
     reminder: Dict[str, Any] = {
         "id": rid,
         "title": args.title,
         "notes": args.notes or "",
         "status": "active",
-        "schedule": {
-            "type": "once",
-            "value": args.when,
-            "timezone": tz_name,
-            "offset_minutes": offset_minutes,
-        },
+        "schedule": schedule,
         "event_at": _iso(when),
         "next_run_at": _iso(fire_at),
         "channels": [],
@@ -268,7 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("create", help="Create a reminder")
     c.add_argument("--title", required=True)
-    c.add_argument("--when", required=True, help="YYYY-MM-DD or YYYY-MM-DD HH:MM")
+    c.add_argument("--schedule", choices=["once", "daily"], default="once", help="Reminder schedule type")
+    c.add_argument("--when", default=None, help="YYYY-MM-DD or YYYY-MM-DD HH:MM for once reminders")
+    c.add_argument("--time", default=None, help="HH:MM for recurring reminders such as daily")
     c.add_argument("--offset-minutes", type=int, default=None, help="Offset minutes for notification time")
     c.add_argument("--notes", default="")
     c.add_argument("--mirror", choices=["none", "apple"], default="none")

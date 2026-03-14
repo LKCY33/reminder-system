@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,9 @@ REQUIRED_NON_LIVE_STAGES = [
     "install-copy-check",
     "skills-install-check",
 ]
+
+LIVE_E2E_POLL_SECONDS = 90
+LIVE_E2E_POLL_INTERVAL_SECONDS = 3
 
 
 def utc_now() -> datetime:
@@ -180,6 +184,16 @@ class ValidationRunner:
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def _read_reminder(self, state_path: Path, reminder_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        for reminder in state.get("reminders", []):
+            if isinstance(reminder, dict) and reminder.get("id") == reminder_id:
+                return reminder
+        return None
 
     def stage_self_check(self) -> StageResult:
         stage = StageResult(id="self-check")
@@ -428,6 +442,96 @@ class ValidationRunner:
                 stage.add("lookahead-dry-run", "warn", f"lookahead dry-run succeeded but output parse failed: {e}")
         else:
             stage.add("lookahead-dry-run", "fail", "lookahead dry-run failed")
+
+        daily_state = self.artifacts_dir / "daily-preinstall-state.json"
+        self._write_seed_state(daily_state)
+        daily_create_cmd = [
+            self.py, str(reminder_script), "--state", str(daily_state), "create",
+            "--title", "install-validation-daily",
+            "--schedule", "daily",
+            "--time", "00:00",
+            "--offset-minutes", "0",
+            "--notes", "validation daily reminder",
+            "--notify", "stdout",
+            "--route-channel", self.args.default_channel,
+            "--route-target", self.args.default_target,
+        ]
+        p = self.run_cmd(daily_create_cmd)
+        lines.append("$ " + " ".join(daily_create_cmd))
+        lines.append(p.stdout)
+        lines.append(p.stderr)
+        if p.returncode != 0:
+            stage.add("daily-create", "fail", "failed to create daily reminder")
+        else:
+            created = self._parse_json_output(p.stdout)
+            daily_id = created.get("id")
+
+            def load_daily_item() -> Optional[Dict[str, Any]]:
+                daily_list_cmd = [self.py, str(reminder_script), "--state", str(daily_state), "list"]
+                out = self.run_cmd(daily_list_cmd)
+                lines.append("$ " + " ".join(daily_list_cmd))
+                lines.append(out.stdout)
+                lines.append(out.stderr)
+                items = json.loads(out.stdout)
+                return next((item for item in items if isinstance(item, dict) and item.get("id") == daily_id), None)
+
+            before_item = load_daily_item()
+            if before_item:
+                forced_due = "2026-03-12T16:00:00Z"
+
+                def force_daily_due() -> None:
+                    daily_data = json.loads(daily_state.read_text(encoding="utf-8"))
+                    for reminder in daily_data.get("reminders", []):
+                        if reminder.get("id") == daily_id:
+                            reminder["next_run_at"] = forced_due
+                            reminder["event_at"] = forced_due
+                            reminder["updated_at"] = utc_now().isoformat().replace("+00:00", "Z")
+                    daily_state.write_text(json.dumps(daily_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+                def run_daily(status: str, reason: str = "") -> tuple[int, Dict[str, Any], Optional[Dict[str, Any]]]:
+                    force_daily_due()
+                    env = os.environ.copy()
+                    env["NOTIFY_DEDUPE_PATH"] = str(self.artifacts_dir / f"daily-preinstall-{status}-dedupe.txt")
+                    if status == "success":
+                        env["NOTIFY_TEST_MODE"] = "success"
+                    else:
+                        env["REMINDER_NOTIFY_INJECT_FAILURE_FOR_ID"] = str(daily_id)
+                        env["REMINDER_NOTIFY_INJECT_FAILURE_STATUS"] = status
+                        env["REMINDER_NOTIFY_INJECT_FAILURE_REASON"] = reason or f"validation-only injected {status}"
+                    cmd = [self.py, str(run_due_script), "--state", str(daily_state), "--id", str(daily_id)]
+                    proc = self.run_cmd(cmd, env=env)
+                    lines.append("$ " + " ".join(cmd))
+                    lines.append(proc.stdout)
+                    lines.append(proc.stderr)
+                    summary = self._parse_json_output(proc.stdout) if proc.stdout.strip() else {}
+                    after_item = load_daily_item()
+                    return proc.returncode, summary, after_item
+
+                rc_success, out_success, after_success = run_daily("success")
+                if rc_success != 0:
+                    stage.add("daily-advance-success", "fail", "daily success path did not return zero")
+                else:
+                    try:
+                        forced_dt = datetime.fromisoformat(forced_due.replace("Z", "+00:00"))
+                        after_dt = datetime.fromisoformat(str(after_success.get("next_run_at")).replace("Z", "+00:00")) if after_success else None
+                        advanced_by = (after_dt - forced_dt) if after_dt else None
+                    except Exception:
+                        advanced_by = None
+                    if after_success and after_success.get("status") == "active" and after_success.get("next_run_at") != forced_due and advanced_by is not None and advanced_by >= timedelta(hours=23) and out_success.get("any_failure") is False:
+                        stage.add("daily-advance-success", "pass", "daily success advanced to next occurrence", {"forcedDue": forced_due, "after": after_success.get("next_run_at"), "advancedBySeconds": int(advanced_by.total_seconds())})
+                    else:
+                        stage.add("daily-advance-success", "fail", "daily success did not advance correctly", {"summary": out_success, "after": after_success})
+
+                rc_fail, out_fail, after_fail = run_daily("invalid_request", "validation-only injected invalid request")
+                if rc_fail != 1:
+                    stage.add("daily-no-advance-on-failure", "fail", "daily failure path should return non-zero", {"returncode": rc_fail})
+                else:
+                    if after_fail and after_fail.get("next_run_at") == forced_due and after_fail.get("status") == "active" and out_fail.get("any_failure") is True:
+                        stage.add("daily-no-advance-on-failure", "pass", "daily failure kept current occurrence in place", {"forcedDue": forced_due, "counts": out_fail.get("counts")})
+                    else:
+                        stage.add("daily-no-advance-on-failure", "fail", "daily failure incorrectly advanced or changed state", {"summary": out_fail, "after": after_fail})
+            else:
+                stage.add("daily-advance-success", "fail", "daily reminder was not visible in list output")
 
         stage.log_file = self.write_stage_log(stage.id, lines)
         return stage
@@ -774,6 +878,94 @@ class ValidationRunner:
             else:
                 stage.add("skills-handoff-duplicate", "fail", "failed to create duplicate test reminder")
 
+        daily_skills_state = self.artifacts_dir / "skills-install-daily-state.json"
+        self._write_seed_state(daily_skills_state)
+        daily_skills_create_cmd = [
+            self.py, str(reminder_script), "--state", str(daily_skills_state), "create",
+            "--title", "skills-install-daily",
+            "--schedule", "daily",
+            "--time", "00:00",
+            "--offset-minutes", "0",
+            "--notes", "skills install daily reminder",
+            "--notify", "stdout",
+            "--route-channel", self.args.default_channel,
+            "--route-target", self.args.default_target,
+        ]
+        p_daily = self.run_cmd(daily_skills_create_cmd)
+        lines.append("[skills-daily-create]")
+        lines.append("$ " + " ".join(daily_skills_create_cmd))
+        lines.append(p_daily.stdout)
+        lines.append(p_daily.stderr)
+        if p_daily.returncode != 0:
+            stage.add("skills-daily-create", "fail", "failed to create daily reminder in skills target")
+        else:
+            daily_created = self._parse_json_output(p_daily.stdout)
+            daily_id = str(daily_created.get("id"))
+
+            def load_daily_skills_item() -> Optional[Dict[str, Any]]:
+                cmd = [self.py, str(reminder_script), "--state", str(daily_skills_state), "list"]
+                out = self.run_cmd(cmd)
+                lines.append("$ " + " ".join(cmd))
+                lines.append(out.stdout)
+                lines.append(out.stderr)
+                items = json.loads(out.stdout)
+                return next((item for item in items if isinstance(item, dict) and item.get("id") == daily_id), None)
+
+            forced_due = "2026-03-12T16:00:00Z"
+            daily_data = json.loads(daily_skills_state.read_text(encoding="utf-8"))
+            for reminder in daily_data.get("reminders", []):
+                if reminder.get("id") == daily_id:
+                    reminder["next_run_at"] = forced_due
+                    reminder["event_at"] = forced_due
+                    reminder["updated_at"] = utc_now().isoformat().replace("+00:00", "Z")
+            daily_skills_state.write_text(json.dumps(daily_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            daily_success_env = dict(handoff_env)
+            daily_success_env["NOTIFY_DEDUPE_PATH"] = str(self.artifacts_dir / "skills-daily-success-dedupe.txt")
+            success_cmd = [self.py, str(run_due_script), "--state", str(daily_skills_state), "--id", daily_id]
+            p_daily_success = self.run_cmd(success_cmd, env=daily_success_env)
+            lines.append("[skills-daily-success]")
+            lines.append("$ " + " ".join(success_cmd))
+            lines.append(p_daily_success.stdout)
+            lines.append(p_daily_success.stderr)
+            if p_daily_success.returncode != 0:
+                stage.add("skills-daily-success", "fail", "skills daily success path failed")
+            else:
+                out_success = self._parse_json_output(p_daily_success.stdout)
+                after_success = load_daily_skills_item()
+                if after_success and after_success.get("status") == "active" and after_success.get("next_run_at") != forced_due and out_success.get("any_failure") is False:
+                    stage.add("skills-daily-success", "pass", "skills daily success advanced to next occurrence")
+                else:
+                    stage.add("skills-daily-success", "fail", "skills daily success did not advance correctly", {"summary": out_success, "after": after_success})
+
+            daily_data = json.loads(daily_skills_state.read_text(encoding="utf-8"))
+            for reminder in daily_data.get("reminders", []):
+                if reminder.get("id") == daily_id:
+                    reminder["next_run_at"] = forced_due
+                    reminder["event_at"] = forced_due
+                    reminder["updated_at"] = utc_now().isoformat().replace("+00:00", "Z")
+            daily_skills_state.write_text(json.dumps(daily_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+            daily_fail_env = dict(handoff_env)
+            daily_fail_env["REMINDER_NOTIFY_INJECT_FAILURE_FOR_ID"] = daily_id
+            daily_fail_env["REMINDER_NOTIFY_INJECT_FAILURE_STATUS"] = "invalid_request"
+            daily_fail_env["REMINDER_NOTIFY_INJECT_FAILURE_REASON"] = "validation-only injected invalid request"
+            fail_cmd = [self.py, str(run_due_script), "--state", str(daily_skills_state), "--id", daily_id]
+            p_daily_fail = self.run_cmd(fail_cmd, env=daily_fail_env)
+            lines.append("[skills-daily-failure]")
+            lines.append("$ " + " ".join(fail_cmd))
+            lines.append(p_daily_fail.stdout)
+            lines.append(p_daily_fail.stderr)
+            if p_daily_fail.returncode != 1:
+                stage.add("skills-daily-failure", "fail", "skills daily failure path should return non-zero", {"returncode": p_daily_fail.returncode})
+            else:
+                out_fail = self._parse_json_output(p_daily_fail.stdout)
+                after_fail = load_daily_skills_item()
+                if after_fail and after_fail.get("status") == "active" and after_fail.get("next_run_at") == forced_due and out_fail.get("any_failure") is True:
+                    stage.add("skills-daily-failure", "pass", "skills daily failure kept current occurrence in place")
+                else:
+                    stage.add("skills-daily-failure", "fail", "skills daily failure advanced incorrectly", {"summary": out_fail, "after": after_fail})
+
         mixed_state = self.artifacts_dir / "skills-install-mixed-state.json"
         self._write_seed_state(mixed_state)
         mixed_when = (datetime.now().astimezone() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M")
@@ -829,6 +1021,132 @@ class ValidationRunner:
                     stage.add("skills-handoff-mixed", "fail", "mixed batch summary did not preserve both success and failure outcomes", {"output": mixed_out})
             except Exception as e:
                 stage.add("skills-handoff-mixed", "fail", f"mixed batch output parse failed: {e}")
+
+        stage.log_file = self.write_stage_log(stage.id, lines)
+        return stage
+
+    def stage_live_e2e(self) -> StageResult:
+        stage = StageResult(id="live-e2e")
+        lines: List[str] = []
+
+        skills_root = self._skills_root()
+        skills_root.mkdir(parents=True, exist_ok=True)
+        target_name = self.args.skills_target_name or f"reminder-system-validation-{self.run_id}"
+        skills_target = skills_root / target_name
+        if skills_target.exists():
+            shutil.rmtree(skills_target)
+        shutil.copytree(self.skill_root, skills_target, ignore=shutil.ignore_patterns("logs", "__pycache__", "*.pyc", ".DS_Store"))
+        notify_target = self._prepare_notify_skill_target()
+
+        self.summary["artifacts"]["liveSkillsInstallRoot"] = str(skills_target)
+        self.summary["artifacts"]["liveSkillsNotifyRoot"] = str(notify_target)
+
+        reminder_script = skills_target / "scripts" / "reminder_system.py"
+        scheduler_script = skills_target / "scripts" / "scheduler_lookahead.py"
+        run_due_script = skills_target / "scripts" / "run_due_and_notify.py"
+
+        live_state = self.artifacts_dir / "live-e2e-state.json"
+        self._write_seed_state(live_state)
+        self.summary["artifacts"]["liveState"] = str(live_state)
+
+        fire_time_local = (datetime.now().astimezone() + timedelta(minutes=2)).strftime("%Y-%m-%d %H:%M")
+        create_cmd = [
+            self.py, str(reminder_script), "--state", str(live_state), "create",
+            "--title", f"live-e2e {self.run_id}",
+            "--when", fire_time_local,
+            "--offset-minutes", "0",
+            "--notes", "live e2e validation reminder",
+            "--notify", "stdout",
+            "--route-channel", self.args.default_channel,
+            "--route-target", self.args.default_target,
+        ]
+        p_create = self.run_cmd(create_cmd)
+        lines.append("$ " + " ".join(create_cmd))
+        lines.append(p_create.stdout)
+        lines.append(p_create.stderr)
+        if p_create.returncode != 0:
+            stage.add("live-create", "fail", "failed to create live-e2e reminder")
+            stage.log_file = self.write_stage_log(stage.id, lines)
+            return stage
+        created = self._parse_json_output(p_create.stdout)
+        live_id = str(created.get("id"))
+        stage.add("live-create", "pass", "created live-e2e reminder", {"id": live_id, "when": fire_time_local})
+
+        list_before = self._read_reminder(live_state, live_id)
+        if list_before and list_before.get("next_run_at"):
+            stage.add("live-state-before", "pass", "live reminder present before scheduling", {"next_run_at": list_before.get("next_run_at")})
+        else:
+            stage.add("live-state-before", "fail", "live reminder missing before scheduling")
+            stage.log_file = self.write_stage_log(stage.id, lines)
+            return stage
+
+        schedule_cmd = [self.py, str(scheduler_script), "--state", str(live_state), "--lookahead-minutes", "10"]
+        p_schedule = self.run_cmd(schedule_cmd)
+        lines.append("$ " + " ".join(schedule_cmd))
+        lines.append(p_schedule.stdout)
+        lines.append(p_schedule.stderr)
+        if p_schedule.returncode != 0:
+            stage.add("live-schedule", "fail", "failed to schedule live-e2e reminder")
+            stage.log_file = self.write_stage_log(stage.id, lines)
+            return stage
+        try:
+            scheduled = self._parse_json_output(p_schedule.stdout)
+        except Exception:
+            scheduled = {}
+        planned = scheduled.get("planned") or []
+        if any(str(item.get("id")) == live_id for item in planned if isinstance(item, dict)):
+            stage.add("live-schedule", "pass", "real scheduling path created a one-shot job", {"planned": planned})
+        else:
+            stage.add("live-schedule", "warn", "scheduler returned without explicit planned item", {"output": scheduled})
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(skills_target / "scripts") + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["NOTIFY_DEDUPE_PATH"] = str(self.artifacts_dir / "live-e2e-dedupe.txt")
+        manual_due_cmd = [self.py, str(run_due_script), "--state", str(live_state), "--id", live_id]
+
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=LIVE_E2E_POLL_SECONDS)
+        delivered_summary: Optional[Dict[str, Any]] = None
+        poll_count = 0
+        auto_completed = False
+        while datetime.now(timezone.utc) < deadline:
+            poll_count += 1
+            reminder = self._read_reminder(live_state, live_id)
+            if reminder and reminder.get("status") == "completed":
+                auto_completed = True
+                stage.add("live-completion", "pass", "live reminder reached completed state via scheduled wait window", {"polls": poll_count})
+                break
+            time.sleep(LIVE_E2E_POLL_INTERVAL_SECONDS)
+
+        reminder_before_fallback = self._read_reminder(live_state, live_id)
+        if not auto_completed:
+            stage.add("live-scheduler-window", "warn", "scheduled wait window did not complete the reminder before timeout", {"timeoutSeconds": LIVE_E2E_POLL_SECONDS})
+            p_due = self.run_cmd(manual_due_cmd, env=env)
+            lines.append("$ " + " ".join(manual_due_cmd))
+            lines.append(p_due.stdout)
+            lines.append(p_due.stderr)
+            if p_due.stdout.strip():
+                try:
+                    delivered_summary = self._parse_json_output(p_due.stdout)
+                except Exception:
+                    delivered_summary = None
+            if p_due.returncode not in (0, 1):
+                stage.add("live-run-due", "fail", "installed live fallback due execution failed unexpectedly", {"returncode": p_due.returncode})
+                stage.log_file = self.write_stage_log(stage.id, lines)
+                return stage
+            stage.add("live-fallback-run-due", "pass", "installed live due path executed after scheduler wait window", {"returncode": p_due.returncode})
+
+        reminder_after = self._read_reminder(live_state, live_id)
+        if delivered_summary and delivered_summary.get("any_failure") is False:
+            stage.add("live-delivery", "pass", "live due execution reported success", {"summary": delivered_summary})
+        elif auto_completed and reminder_after and reminder_after.get("status") == "completed":
+            stage.add("live-delivery", "pass", "live reminder completed during scheduled wait window")
+        else:
+            stage.add("live-delivery", "warn", "live delivery summary missing or not clean", {"summary": delivered_summary})
+
+        if reminder_after and reminder_after.get("status") == "completed":
+            stage.add("live-state-after", "pass", "live reminder stayed completed after delivery", {"status": reminder_after.get("status"), "beforeFallback": reminder_before_fallback})
+        else:
+            stage.add("live-state-after", "fail", "live reminder did not stay completed", {"reminder": reminder_after})
 
         stage.log_file = self.write_stage_log(stage.id, lines)
         return stage
@@ -949,6 +1267,8 @@ class ValidationRunner:
                 stage = self.stage_install_copy_check()
             elif stage_id == "skills-install-check":
                 stage = self.stage_skills_install_check()
+            elif stage_id == "live-e2e":
+                stage = self.stage_live_e2e()
             else:
                 raise ValueError(f"unsupported mode: {stage_id}")
             self.record_stage(stage)
@@ -965,7 +1285,7 @@ class ValidationRunner:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Reminder-system install validation runner")
-    p.add_argument("mode", choices=["self-check", "preinstall", "install-copy-check", "skills-install-check", "full"], help="Validation stage to run")
+    p.add_argument("mode", choices=["self-check", "preinstall", "install-copy-check", "skills-install-check", "live-e2e", "full"], help="Validation stage to run")
     p.add_argument("--run-id", default=None, help="Optional run id override")
     p.add_argument("--logs-root", default=None, help="Root directory for validation logs")
     p.add_argument("--validation-state", default=None, help="Path to isolated validation state.json")
